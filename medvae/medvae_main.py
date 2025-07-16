@@ -98,6 +98,62 @@ class MVAE(torch.nn.Module):
             # This is the latent representation of the image
             return latent.squeeze().squeeze()
 
+    def encode(self, img: torch.tensor):
+        """Encode the image into a latent representation. (S1 for 2D, S2 for 3D)"""
+        if "3d" in self.model_name:
+
+            def encode_latent(patch):
+                z, _, _ = self.model(patch, decode=False)
+                return z
+
+            roi_size = roi_size_calc(img.shape[-3:], target_gpu_dim=self.gpu_dim)
+            s2_latent = sliding_window_inference(
+                inputs=img,
+                roi_size=roi_size,
+                sw_batch_size=1,
+                mode="gaussian",
+                predictor=encode_latent,
+            )
+
+            return s2_latent
+
+        if "2d" in self.model_name:
+            s1_latent = self.model.encode(img).sample()
+            return s1_latent
+
+    def decode(self, latent: torch.tensor):
+        """Decode the latent representation into an image. (S1 for 2D, S2 for 3D)"""
+        if "3d" in self.model_name:
+
+            def decode_latent(patch):
+                dec = self.model.decode(patch)
+                return dec
+
+            # Extract compression factor from model name (e.g., "medvae_4_1_3d" -> 4)
+            compression_factor = int(self.model_name.split("_")[1])
+
+            # Calculate ROI size for the original dimensions
+            roi_size = roi_size_calc(
+                [x * compression_factor for x in latent.shape[-3:]],
+                target_gpu_dim=self.gpu_dim,
+            )
+
+            # Scale down the ROI size to match the latent space
+            roi_size = [size // compression_factor for size in roi_size]
+
+            dec = sliding_window_inference(
+                inputs=latent,
+                roi_size=roi_size,
+                sw_batch_size=1,
+                mode="gaussian",
+                predictor=decode_latent,
+            )
+            return dec
+
+        if "2d" in self.model_name:
+            dec = self.model.decode(latent)
+            return dec
+
     """
     Forward pass for the model. It will return the S2 2D and 3D latent representation.
     @param img: The image to run inference on.
