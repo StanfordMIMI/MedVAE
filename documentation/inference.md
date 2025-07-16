@@ -81,6 +81,16 @@ with torch.no_grad():
 
 The `decoded_img` variable will contain the decoded image, and the `latent` variable will contain the latent representation of the input image.
 
+## Using MedVAE part of LDM pipelines
+
+We provide two functions, `encode` and `decode`, to work with latent representations produced by the model: Stage 1 latents for 2D images and Stage 2 latents for 3D volumes. These latents can potentially be used in downstream tasks such as medical latent diffusion models (*though we have not tested this*).
+
+```python
+with torch.no_grad():
+    latent = model.encode(img)
+    dec = model.decode(img)
+```
+
 ## 🖥️ CLI Usage
 
 The CLI script runs inference using MedVAE, processing 2D or 3D medical images to generate latent representations. It allows users to specify a pretrained MedVAE model and input modalities (X-ray, CT, MRI). Given an input directory, it will process all the medical images into latent representations and save them in the specified folder.

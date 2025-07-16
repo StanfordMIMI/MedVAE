@@ -1,6 +1,6 @@
 [project]
 name = "medvae"
-version = "0.1.1"
+version = "0.1.4"
 requires-python = ">=3.9"
 description = "MedVAE is a family of six medical image autoencoders that can encode high-dimensional medical images into latent representations."
 readme = "README.md"
