@@ -86,13 +86,13 @@ class GenericDataset(Dataset):
         if isinstance(split_column, str) and isinstance(split_name, str):
             self.df = self.df.filter(pl.col(split_column) == split_name)
 
-        # Generate image paths
+        # Generate image paths (list comprehension is polars-version agnostic;
+        # Series.apply was renamed to map_elements in newer polars).
         if img_column is not None:
-            self.samples["img"] = (
-                self.df.get_column(img_column)
-                .apply(lambda x: os.path.join(self.img_dir, f"{x}{img_suffix or ''}"))
-                .to_list()
-            )
+            self.samples["img"] = [
+                os.path.join(self.img_dir, f"{x}{img_suffix or ''}")
+                for x in self.df.get_column(img_column).to_list()
+            ]
             
         # Extract the columns with labels
         if lbl_columns is not None:
@@ -104,11 +104,10 @@ class GenericDataset(Dataset):
 
         # Extract the column with masks
         if msk_column is not None:
-            self.samples["msk"] = (
-                self.df.get_column(msk_column)
-                .apply(lambda x: os.path.join(self.msk_dir, f"{x}{msk_suffix or ''}"))
-                .to_list()
-            )
+            self.samples["msk"] = [
+                os.path.join(self.msk_dir, f"{x}{msk_suffix or ''}")
+                for x in self.df.get_column(msk_column).to_list()
+            ]
 
         self.print_stats()
 

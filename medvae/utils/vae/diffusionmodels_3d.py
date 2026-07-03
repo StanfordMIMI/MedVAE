@@ -245,9 +245,23 @@ class Decoder(nn.Module):
         h = checkpoint(self.mid.attn_1, h, use_reentrant=False)
         h = checkpoint(self.mid.block_2, h, temb, use_reentrant=False)
 
+        # Optional model-parallel split: levels with index < ``split_from_level``
+        # (the highest-resolution, most memory-heavy levels) plus the output layers
+        # live on ``split_device``. ``h`` is moved across at the boundary; the
+        # transfer is autograd-aware so gradients flow back to the first device.
+        # Optional model-parallel split. ``block_device`` maps (i_level, i_block)
+        # -> device: at that point ``h`` (and subsequent modules) move to that
+        # device. ``output_device`` places the final norm/conv/tanh. The moves are
+        # autograd-aware so gradients flow back across GPUs. Default (unset) keeps
+        # the whole decoder on one device -- behavior is unchanged.
+        block_device = getattr(self, "block_device", None)
+        output_device = getattr(self, "output_device", None)
+
         # upsampling
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
+                if block_device is not None and (i_level, i_block) in block_device:
+                    h = h.to(block_device[(i_level, i_block)])
                 h = checkpoint(
                     self.up[i_level].block[i_block], h, temb, use_reentrant=False
                 )
@@ -262,6 +276,8 @@ class Decoder(nn.Module):
         if self.give_pre_end:
             return h
 
+        if output_device is not None:
+            h = h.to(output_device)
         h = checkpoint(self.norm_out, h, use_reentrant=False)
         h = nonlinearity(h)
         h = checkpoint(self.conv_out, h, use_reentrant=False)
@@ -297,7 +313,11 @@ class LinearAttention(nn.Module):
 
 
 def nonlinearity(x):
-    return x * torch.sigmoid(x)
+    # Mathematically identical to x * sigmoid(x) (SiLU/Swish), but the fused
+    # kernel has a memory-efficient backward that recomputes from the input
+    # instead of storing sigmoid(x) and the product as separate full-res tensors.
+    # At (224,224,160) full resolution this saves many GB per activation.
+    return torch.nn.functional.silu(x)
 
 
 def make_attn(in_channels, attn_type="vanilla"):
@@ -377,7 +397,7 @@ class AttnBlock(nn.Module):
             in_channels, in_channels, kernel_size=1, stride=1, padding=0
         )
 
-    def forward(self, x):
+    def forward(self, x, chunk=4096):
         h_ = x
         h_ = self.norm(h_)
         q = self.q(h_)
@@ -386,17 +406,46 @@ class AttnBlock(nn.Module):
 
         # compute attention
         b, c, d, h, w = q.shape
-        q = q.reshape(b, c, d * h * w)
-        q = q.permute(0, 2, 1)  # b,dhw,c
-        k = k.reshape(b, c, d * h * w)  # b,c,dhw
-        w_ = torch.bmm(q, k)  # b,dhw,dhw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-        w_ = w_ * (int(c) ** (-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
+        n = d * h * w
+        q = q.reshape(b, c, n)
+        q = q.permute(0, 2, 1)  # b,n,c
+        k = k.reshape(b, c, n)  # b,c,n
+        v = v.reshape(b, c, n)  # b,c,n
+        scale = int(c) ** (-0.5)
 
-        # # attend to values
-        v = v.reshape(b, c, d * h * w)
-        w_ = w_.permute(0, 2, 1)  # b,dhw,dhw (first hw of k, second of q)
-        h_ = torch.bmm(v, w_)  # b, c,dhw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+        if n <= chunk:
+            # dense path (unchanged): materializes the full (n, n) matrix
+            w_ = torch.bmm(q, k)  # b,n,n    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+            w_ = w_ * scale
+            w_ = torch.nn.functional.softmax(w_, dim=2)
+            w_ = w_.permute(0, 2, 1)  # b,n,n (first n of k, second of q)
+            h_ = torch.bmm(v, w_)  # b,c,n   h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+        else:
+            # tiled over queries: process `chunk` query positions at a time so the
+            # full (n, n) attention matrix is never materialized. For 3D volumes n
+            # can be very large (n = d*h*w), and an (n, n) tensor is prohibitive.
+            # Numerically identical to the dense path above (each query row is an
+            # independent softmax over all keys).
+            def _attn_chunk(qs, k, v):
+                s = torch.bmm(qs, k) * scale  # b,m,n
+                s = torch.nn.functional.softmax(s, dim=2)
+                # b,c,m   out[b,c,iq] = sum_j v[b,c,j] s[b,iq,j]
+                return torch.bmm(v, s.permute(0, 2, 1))
+
+            outs = []
+            for i in range(0, n, chunk):
+                qs = q[:, i : i + chunk]  # b,m,c
+                # Checkpoint each chunk so its (m, n) score matrix is recomputed in
+                # backward instead of all chunks being held at once (which would
+                # rebuild the full (n, n) graph and defeat the tiling in backward).
+                if self.training and qs.requires_grad:
+                    outs.append(
+                        checkpoint(_attn_chunk, qs, k, v, use_reentrant=False)
+                    )
+                else:
+                    outs.append(_attn_chunk(qs, k, v))
+            h_ = torch.cat(outs, dim=2)  # b,c,n
+
         h_ = h_.reshape(b, c, d, h, w)
 
         h_ = self.proj_out(h_)
@@ -441,19 +490,32 @@ class ResnetBlock(nn.Module):
                     in_channels, out_channels, kernel_size=1, stride=1, padding=0
                 )
 
+    def _part1(self, h):
+        return self.conv1(nonlinearity(self.norm1(h)))
+
+    def _part2(self, h):
+        return self.conv2(self.dropout(nonlinearity(self.norm2(h))))
+
     def forward(self, x, temb):
-        h = x
-        h = self.norm1(h)
-        h = nonlinearity(h)
-        h = self.conv1(h)
+        # Optionally checkpoint the two conv halves separately. For the heaviest
+        # full-res blocks this roughly halves the recompute peak (only one half's
+        # activations are materialized at a time in backward). temb must be None.
+        if getattr(self, "inner_checkpoint", False) and self.training and x.requires_grad:
+            assert temb is None, "inner_checkpoint path does not support temb"
+            h = checkpoint(self._part1, x, use_reentrant=False)
+            h = checkpoint(self._part2, h, use_reentrant=False)
+        else:
+            h = self.norm1(x)
+            h = nonlinearity(h)
+            h = self.conv1(h)
 
-        if temb is not None:
-            h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None]
+            if temb is not None:
+                h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None]
 
-        h = self.norm2(h)
-        h = nonlinearity(h)
-        h = self.dropout(h)
-        h = self.conv2(h)
+            h = self.norm2(h)
+            h = nonlinearity(h)
+            h = self.dropout(h)
+            h = self.conv2(h)
 
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:

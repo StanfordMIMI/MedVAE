@@ -1,25 +1,14 @@
 defaults:
   - default.yaml
 
+# Full-volume CT loader (224x224x160) for the global-bottleneck model. Unlike
+# mri_ct_3d.yaml, this uses load_ct_merlin (whole resampled volume) instead of
+# load_ct_3d_finetune (random 64^3 crops), so the bottleneck sees global context.
+
 train:
   dataset:
     _target_: medvae.dataloaders.ConcatDataset
     datasets:
-      # # MRI
-      # - _target_: medvae.dataloaders.GenericDataset
-      #   split_path: ${paths.data_dir}/mri_data.csv
-      #   split_column: split
-      #   split_name: train
-      #   data_dir: ${paths.data_dir}/mri_data/
-      #   dataset_id: 0
-      #   img_column: image_uuid
-      #   img_suffix: .nii.gz
-      #   img_transform:
-      #     _target_: torchvision.transforms.Compose
-      #     transforms:
-      #       - _partial_: true
-      #         _target_: medvae.utils.loaders.load_mri_3d_finetune
-      
       # CT
       - _target_: medvae.dataloaders.GenericDataset
         split_path: ${paths.data_dir}/ct_data.csv
@@ -38,21 +27,6 @@ valid:
   dataset:
     _target_: medvae.dataloaders.ConcatDataset
     datasets:
-      # # MRI
-      # - _target_: medvae.dataloaders.GenericDataset
-      #   split_path: ${paths.data_dir}/mri_data.csv
-      #   split_column: split
-      #   split_name: val
-      #   data_dir: ${paths.data_dir}/mri_data/
-      #   dataset_id: 0
-      #   img_column: image_uuid
-      #   img_suffix: .nii.gz
-      #   img_transform:
-      #     _target_: torchvision.transforms.Compose
-      #     transforms:
-      #       - _partial_: true
-      #         _target_: medvae.utils.loaders.load_mri_3d_finetune
-      
       # CT
       - _target_: medvae.dataloaders.GenericDataset
         split_path: ${paths.data_dir}/ct_data.csv
@@ -72,21 +46,6 @@ test:
   dataset:
     _target_: medvae.dataloaders.ConcatDataset
     datasets:
-      # # MRI
-      # - _target_: medvae.dataloaders.GenericDataset
-      #   split_path: ${paths.data_dir}/mri_data.csv
-      #   split_column: split
-      #   split_name: test
-      #   data_dir: ${paths.data_dir}/mri_data/
-      #   dataset_id: 0
-      #   img_column: image_uuid
-      #   img_suffix: .nii.gz
-      #   img_transform:
-      #     _target_: torchvision.transforms.Compose
-      #     transforms:
-      #       - _partial_: true
-      #         _target_: medvae.utils.loaders.load_mri_3d_finetune
-      
       # CT
       - _target_: medvae.dataloaders.GenericDataset
         split_path: ${paths.data_dir}/ct_data.csv

@@ -1,5 +1,5 @@
 from huggingface_hub import hf_hub_download
-from medvae.models import AutoencoderKL_2D, AutoencoderKL_3D
+from medvae.models import AutoencoderKL_2D, AutoencoderKL_3D, AutoencoderKLBottleneck
 from omegaconf import OmegaConf
 from medvae.utils.lora import inject_trainable_lora_extended
 from medvae.utils.loaders import load_mri_3d, load_ct_3d, load_2d
@@ -32,6 +32,15 @@ FILE_DICT_ASSOCIATIONS = {
         "ckpt": "model_weights/vae_4x_1c_3D.ckpt",
     },
     "medvae_8_1_3d": {
+        "config": "model_weights/medvae_8x1.yaml",
+        "ckpt": "model_weights/vae_8x_1c_3D.ckpt",
+    },
+    # Frozen backbone + trainable global bottleneck (reuse the base 3D weights).
+    "medvae_4_1_3d_bottleneck": {
+        "config": "model_weights/medvae_4x1.yaml",
+        "ckpt": "model_weights/vae_4x_1c_3D.ckpt",
+    },
+    "medvae_8_1_3d_bottleneck": {
         "config": "model_weights/medvae_8x1.yaml",
         "ckpt": "model_weights/vae_8x_1c_3D.ckpt",
     },
@@ -108,6 +117,18 @@ def build_model(
             ddconfig=conf.ddconfig,
             embed_dim=conf.embed_dim,
         )
+        model.init_from_ckpt(
+            ckpt_fpath if existing_weight is None else existing_weight,
+            state_dict=state_dict,
+        )
+    elif model_name in ("medvae_4_1_3d_bottleneck", "medvae_8_1_3d_bottleneck"):
+        conf = OmegaConf.load(config_fpath)
+        model = AutoencoderKLBottleneck(
+            ddconfig=conf.ddconfig,
+            embed_dim=conf.embed_dim,
+        )
+        # Loads pretrained weights into the (frozen) backbone; the bottleneck
+        # heads are absent from the checkpoint and stay at their initialization.
         model.init_from_ckpt(
             ckpt_fpath if existing_weight is None else existing_weight,
             state_dict=state_dict,

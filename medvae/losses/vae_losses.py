@@ -21,7 +21,7 @@ Take a 2D input array and average out the loss across all the slices to get a 3D
 """
 
 
-def discriminator_2d_nets_to_3d(net, inp_arr):
+def discriminator_2d_nets_to_3d(net, inp_arr, checkpoint=False):
     p_loss_arr = []
     dims = ["depth", "height", "width"]
 
@@ -36,10 +36,18 @@ def discriminator_2d_nets_to_3d(net, inp_arr):
             else:  # width
                 slice_i = inp_arr[:, :, :, :, j]
 
-            # Calculate perceptual loss for the current slice
-            p_loss_arr.append(net(slice_i.contiguous()))
+            # Calculate discriminator logits for the current slice
+            if checkpoint and slice_i.requires_grad:
+                logits = torch.utils.checkpoint.checkpoint(
+                    net, slice_i.contiguous(), use_reentrant=False
+                )
+            else:
+                logits = net(slice_i.contiguous())
+            # Reduce each slice's patch map to a scalar so slices taken along axes
+            # of different length (non-cubic volumes) can be stacked.
+            p_loss_arr.append(logits.mean())
 
-    # Average the perceptual loss across all slices
+    # Average across all slices
     return torch.mean(torch.stack(p_loss_arr), 0)
 
 
@@ -228,9 +236,20 @@ class LPIPSWithDiscriminator(nn.Module):
         ignore_keys=[],
         lora=False,
         use_biomedclip_loss=False,
+        checkpoint_slices=False,
+        adaptive_disc_weight=True,
     ):
         super().__init__()
         self.learn_logvar = learn_logvar
+        # Use a fixed discriminator weight instead of the gradient-norm adaptive
+        # one; required for memory-constrained full-volume 3D training (see
+        # calculate_adaptive_weight).
+        self.adaptive_disc_weight = adaptive_disc_weight
+        # When True, each per-slice perceptual/discriminator forward is wrapped in
+        # gradient checkpointing so the ~600 slice graphs of a full 3D volume are
+        # recomputed in backward instead of all held in memory at once. Numerically
+        # identical; only needed for large full-volume 3D inputs (e.g. the bottleneck).
+        self.checkpoint_slices = checkpoint_slices
         self.kl_weight = kl_weight  # Weight assigned to KL regularization term
         self.perceptual_loss = LPIPS().eval()  # Perceptual loss function
         # self.monai_perceptual_loss = PerceptualLoss(spatial_dims=3, network_type="vgg", is_fake_3d=True, fake_3d_ratio=0.1)
@@ -272,6 +291,11 @@ class LPIPSWithDiscriminator(nn.Module):
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer):
         if self.lora:
             return torch.tensor(1.0)
+        elif not self.adaptive_disc_weight:
+            # Fixed disc weight: skips the two extra autograd.grad passes (each
+            # with retain_graph=True) that otherwise keep the whole graph alive and
+            # roughly triple peak memory -- infeasible for full-volume 3D backward.
+            return torch.tensor(self.discriminator_weight, device=nll_loss.device)
         else:
             nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
             g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
@@ -318,11 +342,20 @@ class LPIPSWithDiscriminator(nn.Module):
                             slice_r = reconstructions[:, :, :, :, j]
 
                         # Calculate perceptual loss for the current slice
-                        p_loss_arr.append(
-                            self.perceptual_loss(
+                        if self.checkpoint_slices and slice_r.requires_grad:
+                            pl = torch.utils.checkpoint.checkpoint(
+                                self.perceptual_loss,
+                                slice_i.contiguous(),
+                                slice_r.contiguous(),
+                                use_reentrant=False,
+                            )
+                        else:
+                            pl = self.perceptual_loss(
                                 slice_i.contiguous(), slice_r.contiguous()
                             )
-                        )
+                        # Reduce each slice to a scalar so slices taken along axes of
+                        # different length (non-cubic volumes) can be stacked.
+                        p_loss_arr.append(pl.mean())
 
                 # Average the perceptual loss across all slices
                 p_loss = torch.mean(torch.stack(p_loss_arr))
@@ -357,7 +390,7 @@ class LPIPSWithDiscriminator(nn.Module):
             if d_valid:
                 if len(reconstructions.size()) == 5:
                     logits_fake = discriminator_2d_nets_to_3d(
-                        self.discriminator, reconstructions
+                        self.discriminator, reconstructions, checkpoint=self.checkpoint_slices
                     )
                 else:
                     logits_fake = self.discriminator(reconstructions.contiguous())

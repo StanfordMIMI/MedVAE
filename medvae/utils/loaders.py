@@ -7,6 +7,14 @@ from monai.transforms import (
     CropForeground,
     ScaleIntensityRange,
     RandSpatialCrop,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Orientationd,
+    Spacingd,
+    ScaleIntensityRanged,
+    SpatialPadd,
+    CenterSpatialCropd,
+    ToTensord,
 )
 import torch
 import torch.nn.functional as F
@@ -164,6 +172,42 @@ def load_ct_3d(path: str, dtype: torch.dtype = torch.float32, **kwargs):
     except Exception as e:
         print(f"Error in loading {path} with error: {e}")
         return torch.zeros((1, 256, 256, 256))
+
+
+def load_ct_merlin(path: str, dtype: torch.dtype = torch.float32, **kwargs):
+    """Load a full CT volume at Merlin's fixed 224x224x160 grid.
+
+    Unlike ``load_ct_3d_finetune`` (random 64^3 crops), this returns the whole
+    resampled volume so the global bottleneck can learn context over the full
+    image. Output is normalized to [-1, 1] to match the range the frozen MedVAE
+    backbone was trained on.
+    """
+    transforms_image = Compose(
+        [
+            LoadImaged(keys=["image"]),
+            EnsureChannelFirstd(keys=["image"]),
+            Orientationd(keys=["image"], axcodes="RAS"),
+            Spacingd(keys=["image"], pixdim=(1.5, 1.5, 3), mode=("bilinear")),
+            ScaleIntensityRanged(
+                keys=["image"], a_min=-1000, a_max=1000, b_min=0.0, b_max=1.0, clip=True
+            ),
+            SpatialPadd(keys=["image"], spatial_size=[224, 224, 160], value=0.0),
+            CenterSpatialCropd(
+                roi_size=[224, 224, 160],
+                keys=["image"],
+            ),
+            ToTensord(keys=["image"]),
+        ]
+    )
+
+    try:
+        img = transforms_image({"image": path})["image"]
+        # [0, 1] -> [-1, 1] to match the MedVAE backbone's expected input range.
+        img = MonaiNormalize(mean=[0.5], std=[0.5])(img)
+        return img.as_tensor() if hasattr(img, "as_tensor") else img
+    except Exception as e:
+        print(f"Error in loading {path} with error: {e}")
+        return torch.zeros((1, 224, 224, 160))
 
 
 """

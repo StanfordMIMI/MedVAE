@@ -37,6 +37,8 @@ def parse_arguments(cfg: DictConfig):
         "medvae_8_4_2d",
         "medvae_4_1_3d",
         "medvae_8_1_3d",
+        "medvae_4_1_3d_bottleneck",
+        "medvae_8_1_3d_bottleneck",
     ]
     assert cfg.model_name in valid_model_names, (
         f"model_name must be one of {valid_model_names}. Got: {cfg.model_name}."
@@ -124,7 +126,18 @@ def main(cfg: DictConfig):
     # Create model
     model = create_model(cfg.model_name)
 
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    # Model-parallel: shard the frozen decoder across GPUs so a full-volume 3D
+    # image-space step fits. The model is placed manually and NOT handed to
+    # accelerate.prepare (which would move it to one device / DDP-wrap it).
+    model_parallel = cfg.get("model_parallel", False)
+    if model_parallel:
+        ngpu = cfg.get("model_parallel_gpus", 3)
+        print(f"=> Model-parallel across {ngpu} GPUs")
+        model.to_model_parallel_auto(ngpu)
+        # register so accelerator.save_state / load_state checkpoint the bottleneck
+        accelerator.register_for_checkpointing(model)
+    else:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     # Create two optimizers: one for the autoencoder and one for the discriminator
     print(f"=> Instantiating the optimizer [device={accelerator.device}]")
@@ -132,13 +145,17 @@ def main(cfg: DictConfig):
     batch_size, lr = cfg.batch_size, cfg.base_learning_rate
     lr = gradient_accumulation_steps * batch_size * lr
 
-    # Create autoencoder parameters
-    ae_params = (
-        list(model.encoder.parameters())
-        + list(model.decoder.parameters())
-        + list(model.quant_conv.parameters())
-        + list(model.post_quant_conv.parameters())
-    )
+    # Create autoencoder parameters. For the bottleneck model the backbone is
+    # frozen, so only the trainable bottleneck heads go to the optimizer.
+    if hasattr(model, "bottleneck_parameters"):
+        ae_params = list(model.bottleneck_parameters())
+    else:
+        ae_params = (
+            list(model.encoder.parameters())
+            + list(model.decoder.parameters())
+            + list(model.quant_conv.parameters())
+            + list(model.post_quant_conv.parameters())
+        )
 
     if criterion.learn_logvar:
         ae_params.append(criterion.logvar)
@@ -153,17 +170,26 @@ def main(cfg: DictConfig):
     if cfg.model_name in ["medvae_4_3_2d", "medvae_8_4_2d"]:
         num_metrics += 1
 
-    # Prepare components for multi-gpu/mixed precision training
-    (train_dataloader, valid_dataloader, model, opt_ae, opt_disc, criterion) = (
-        accelerator.prepare(
-            train_dataloader,
-            valid_dataloader,
-            model,
-            opt_ae,
-            opt_disc,
-            criterion,
+    # Prepare components for multi-gpu/mixed precision training. In model-parallel
+    # mode the model is placed manually across GPUs and is intentionally excluded
+    # from prepare; its forward applies autocast internally.
+    if model_parallel:
+        (train_dataloader, valid_dataloader, opt_ae, opt_disc, criterion) = (
+            accelerator.prepare(
+                train_dataloader, valid_dataloader, opt_ae, opt_disc, criterion
+            )
         )
-    )
+    else:
+        (train_dataloader, valid_dataloader, model, opt_ae, opt_disc, criterion) = (
+            accelerator.prepare(
+                train_dataloader,
+                valid_dataloader,
+                model,
+                opt_ae,
+                opt_disc,
+                criterion,
+            )
+        )
 
     # Create metrics: aeloss, discloss, recloss, data(time), batch(time)
     default_metrics = accelerator.prepare(*[MeanMetric() for _ in range(num_metrics)])

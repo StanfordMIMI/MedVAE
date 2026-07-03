@@ -1,0 +1,39 @@
+# @package _global_
+
+defaults:
+  - override /dataloader: mri_ct_3d_bottleneck.yaml
+  - override /metrics: reconstruction_minimal.yaml
+  - override /criterion: lpips_with_discriminator.yaml
+
+# Finetuning parameters to change
+task_name: mri_ct_bottleneck_finetuning
+model_name: medvae_4_1_3d_bottleneck
+stage2: false
+device: cuda
+
+# Training parameters to change
+# Full (224,224,160) image-space training. The frozen decoder's full-res backward
+# is ~43GB; it is sharded across GPUs (model-parallel) so it fits on L40s.
+mixed_precision: "bf16"
+gradient_accumulation_steps: 1
+max_epoch: 6400
+batch_size: 1
+log_every_n_steps: 20
+base_learning_rate: 4.5e-6
+ema_decay: null
+fast_dev_run: false
+
+# Model-parallel: shard the frozen decoder over N GPUs (3 fits at ~41GB/card with
+# the discriminator on). Launch with that many visible GPUs in a SINGLE process,
+# e.g.  CUDA_VISIBLE_DEVICES=0,1,2 medvae_finetune experiment=...  (do NOT use
+# `accelerate launch --multi_gpu`, which is data-parallel and won't help one volume).
+model_parallel: true
+model_parallel_gpus: 3
+
+criterion:
+  num_channels: 1
+  disc_start: 3125
+  # Per-slice checkpointing + fixed disc weight keep the full-volume backward within
+  # memory (avoids holding ~600 slice graphs / the adaptive-weight 3x retain_graph).
+  checkpoint_slices: true
+  adaptive_disc_weight: false
