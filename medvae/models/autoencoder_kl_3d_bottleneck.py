@@ -28,6 +28,93 @@ def _deconv_block(cin, cout, norm=True):
     return nn.Sequential(*layers)
 
 
+class ConvBottleneck(nn.Module):
+    """Fully-convolutional bottleneck over a VAE latent z (no MLP).
+
+    Strided 3D convs compress z (in_ch, D, H, W) to a small spatial code
+    (bottleneck_ch, D/4, H/4, W/4) -- e.g. the 8x latent (1,28,28,20) -> (16,7,7,5)
+    ~= 3.9K values, ~4x compression -- and mirrored transposed convs reconstruct it.
+    The code keeps coarse spatial structure (unlike a flattened global vector), which
+    is far less prone to latent collapse.
+
+    Deterministic by default. If ``variational`` is set, the encoder emits mean+logvar
+    for the code, which is reparameterized and returns a KL term (for optional
+    generative use); default off.
+    """
+
+    def __init__(self, in_ch=1, widths=(64, 128), bottleneck_ch=16, variational=False,
+                 groups=8, mlp=False, mlp_dim=0, code_spatial=(7, 7, 5)):
+        super().__init__()
+        self.variational = variational
+        self.mlp_dim = mlp_dim
+        w0, w1 = widths
+
+        def gn(c):
+            return nn.GroupNorm(groups, c)
+
+        # encoder: two stride-2 downsamples (/4), with a same-res conv per level
+        self.enc = nn.Sequential(
+            nn.Conv3d(in_ch, w0, 3, 2, 1), gn(w0), nn.SiLU(),
+            nn.Conv3d(w0, w0, 3, 1, 1), gn(w0), nn.SiLU(),
+            nn.Conv3d(w0, w1, 3, 2, 1), gn(w1), nn.SiLU(),
+            nn.Conv3d(w1, w1, 3, 1, 1), gn(w1), nn.SiLU(),
+        )
+        self.to_code = nn.Conv3d(w1, bottleneck_ch * (2 if variational else 1), 3, 1, 1)
+
+        # decoder: mirror back up to the latent resolution/channels
+        self.from_code = nn.Conv3d(bottleneck_ch, w1, 3, 1, 1)
+        self.dec = nn.Sequential(
+            gn(w1), nn.SiLU(),
+            nn.Conv3d(w1, w1, 3, 1, 1), gn(w1), nn.SiLU(),
+            nn.ConvTranspose3d(w1, w0, 3, 2, 1, output_padding=1), gn(w0), nn.SiLU(),
+            nn.Conv3d(w0, w0, 3, 1, 1), gn(w0), nn.SiLU(),
+            nn.ConvTranspose3d(w0, in_ch, 3, 2, 1, output_padding=1),
+        )
+        self.bottleneck_ch = bottleneck_ch
+
+        # Optional single global-mixing layer on the flattened code, SAME dim:
+        # Linear(flat, flat) + SiLU, reshaped back to the spatial code. Every output
+        # unit mixes all code positions (fully global) without changing the latent size.
+        flat = bottleneck_ch * code_spatial[0] * code_spatial[1] * code_spatial[2]
+        self.mlp = None       # same-dim single-linear global mixer: Linear(flat,flat)+SiLU
+        if mlp:
+            self.mlp = nn.Sequential(nn.Linear(flat, flat), nn.SiLU())
+        # Projecting MLP: flat -> mlp_dim (the global embedding) -> flat. When
+        # mlp_dim < flat this is a real information bottleneck at mlp_dim.
+        self.mlp_proj = None
+        if mlp_dim > 0:
+            self.mlp_proj = nn.ModuleDict({
+                "down": nn.Linear(flat, mlp_dim),
+                "up": nn.Linear(mlp_dim, flat),
+            })
+            self.mlp_act = nn.SiLU()
+
+    def encode(self, z):
+        c = self.to_code(self.enc(z))
+        if self.variational:
+            mean, logvar = torch.chunk(c, 2, dim=1)
+            return mean, torch.clamp(logvar, -30.0, 20.0)
+        return c, None
+
+    def decode(self, code):
+        return self.dec(self.from_code(code))
+
+    def forward(self, z):
+        mean, logvar = self.encode(z)
+        if self.variational:
+            code = mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
+            kl = 0.5 * (mean.pow(2) + logvar.exp() - 1.0 - logvar).mean()
+        else:
+            code, kl = mean, None
+        if self.mlp is not None:
+            code = self.mlp(code.flatten(1)).reshape(code.shape)
+        if self.mlp_proj is not None:
+            sh = code.shape
+            v = self.mlp_act(self.mlp_proj["down"](code.flatten(1)))  # (B, mlp_dim) embedding
+            code = self.mlp_proj["up"](v).reshape(sh)
+        return self.decode(code), kl
+
+
 class AutoencoderKLBottleneck(AutoencoderKL):
     """MedVAE 3D autoencoder with a frozen pretrained backbone and a trainable
     global bottleneck.
